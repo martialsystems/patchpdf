@@ -642,13 +642,19 @@ function resolveLineTarget(textItems, op) {
   const exactFind = (t) => t.str === find;
   const softFind = (t) => find && t.str.toLowerCase().includes(findLower);
 
-  // 1) id is authoritative only when that run still contains find
+  // 1) If id is set and that run exists, id is authoritative: apply only
+  //    when find matches that run. Never fall through to another cell.
   if (op.id != null) {
     const byId = textItems.find((t) => t.id === op.id);
-    if (byId && onPage(byId)) {
+    if (byId) {
       if (exactFind(byId) || softFind(byId)) {
         return { target: byId, warnings, skipped: null };
       }
+      return {
+        target: null,
+        warnings,
+        skipped: `SKIPPED replace_line: id #${op.id} text did not match find "${find}"`,
+      };
     }
   }
 
