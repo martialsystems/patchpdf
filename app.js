@@ -1,5 +1,5 @@
 /**
- * patchpdf playground — fully client-side
+ * patchpdf playground: fully client-side
  * Copyright (c) 2026 Martial Systems LLC.
  */
 
@@ -95,7 +95,7 @@ function setBusy(busy) {
     if (el.id === "show-key") return;
     if (busy && (el.tagName === "BUTTON" || el.type === "file")) {
       el.disabled = true;
-    } else if (!busy && el.tagName === "BUTTON") {
+    } else if (!busy && (el.tagName === "BUTTON" || el.type === "file")) {
       el.disabled = false;
     }
   });
@@ -270,6 +270,7 @@ function showResult(result) {
   if (result.profileId) parts.push(`profile: ${result.profileId}`);
   if (result.plan?.summary) parts.push(result.plan.summary);
   if (result.applied?.length) parts.push("applied: " + result.applied.join("; "));
+  if (result.skipped?.length) parts.push("skipped: " + result.skipped.join("; "));
   if (result.warnings?.length) parts.push("warnings: " + result.warnings.join("; "));
   els.resultBox.textContent = parts.join("\n");
   if (result.plan) {
@@ -277,6 +278,10 @@ function showResult(result) {
     els.planBox.textContent = JSON.stringify(result.plan, null, 2);
     els.btnApplyPlan.disabled = !result.plan.operations?.length;
   }
+}
+
+function appliedNothing(result) {
+  return (result.skipped?.length || 0) > 0 && !(result.applied?.length);
 }
 
 async function applyHuman() {
@@ -302,14 +307,22 @@ async function applyHuman() {
       originalMetadata: state.origMeta,
     });
     const result = await applyOperations(state.pdfBytes, operations);
-    storeEdited(result.bytes);
     showResult({
       mode: "human",
       plan: { summary: `Updated ${changed} field(s)`, operations },
       applied: result.applied,
+      skipped: result.skipped,
       warnings: result.warnings,
     });
-    setMsg(`Applied ${changed} change(s) — layout preserved where possible.`, "ok");
+    if (appliedNothing(result)) {
+      setMsg(result.skipped[0] || "Nothing applied", "error");
+    } else {
+      storeEdited(result.bytes);
+      setMsg(
+        `Applied ${result.applied?.length || changed} change(s). Layout preserved where possible.`,
+        "ok",
+      );
+    }
   } catch (e) {
     setMsg(e instanceof Error ? e.message : String(e), "error");
   } finally {
@@ -372,6 +385,8 @@ async function runAi({ dryRun }) {
         `Plan ready (${result.plan?.operations?.length || 0} ops). Review, then Apply plan.`,
         "ok",
       );
+    } else if (appliedNothing(result)) {
+      setMsg(result.skipped[0] || "Nothing applied", "error");
     } else {
       if (result.bytes) storeEdited(result.bytes);
       setMsg(result.plan?.summary || "Done", "ok");
@@ -391,14 +406,19 @@ async function applyStoredPlan() {
   setBusy(true);
   try {
     const result = await applyOperations(state.pdfBytes, state.lastPlan.operations);
-    storeEdited(result.bytes);
     showResult({
       mode: "plan",
       plan: state.lastPlan,
       applied: result.applied,
+      skipped: result.skipped,
       warnings: result.warnings,
     });
-    setMsg("Plan applied.", "ok");
+    if (appliedNothing(result)) {
+      setMsg(result.skipped[0] || "Nothing applied", "error");
+    } else {
+      storeEdited(result.bytes);
+      setMsg("Plan applied.", "ok");
+    }
   } catch (e) {
     setMsg(e instanceof Error ? e.message : String(e), "error");
   } finally {
@@ -418,9 +438,11 @@ async function exportDocx() {
   setBusy(true);
   setMsg("Exporting DOCX in your browser…", "info");
   try {
+    const fromEdited = state.preview === "edited" && !!state.editedBytes;
     const result = await exportPdfToDocx(bytes, {
       title: state.meta.title || undefined,
       author: state.meta.author || undefined,
+      fromEditedBytes: fromEdited,
     });
     const base = (state.fileName || "document").replace(/\.pdf$/i, "");
     downloadBytes(
@@ -430,7 +452,7 @@ async function exportDocx() {
     );
     setMsg(
       `DOCX: ${result.pages} page(s), ${result.lines} line(s) from the PDF’s own text geometry. ` +
-        `No rewrite — download the PDF when layout has to stay exact.` +
+        `No rewrite: download the PDF when layout has to stay exact.` +
         (result.warnings.length
           ? " " + result.warnings.join(" ")
           : ""),

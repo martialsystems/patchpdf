@@ -193,7 +193,7 @@ export function validateOperations(rawOps, options = {}) {
   for (let i = 0; i < rawOps.length; i++) {
     const op = rawOps[i];
     if (!op || typeof op !== "object" || typeof op.op !== "string") {
-      warnings.push(`op[${i}]: skipped (not an object with op)`);
+      warnings.push(`SKIPPED op[${i}]: not an object with op`);
       continue;
     }
     let kind = op.op;
@@ -202,14 +202,14 @@ export function validateOperations(rawOps, options = {}) {
       warnings.push(`op[${i}]: "redact" renamed to "cover" (visual cover only)`);
     }
     if (!OP_KINDS.has(kind) && kind !== "cover") {
-      warnings.push(`op[${i}]: unknown op "${op.op}" skipped`);
+      warnings.push(`SKIPPED op[${i}]: unknown op "${op.op}"`);
       continue;
     }
     const n = { ...op, op: kind };
     // Light field checks
     if (kind === "replace_line") {
       if (typeof n.find !== "string" || typeof n.replace !== "string") {
-        warnings.push(`op[${i}]: replace_line needs find/replace strings`);
+        warnings.push(`SKIPPED op[${i}]: replace_line needs find/replace strings`);
         continue;
       }
       if (n.page != null) n.page = Number(n.page);
@@ -219,11 +219,11 @@ export function validateOperations(rawOps, options = {}) {
       n.force = n.force === true;
     } else if (kind === "replace_text" || kind === "cover") {
       if (typeof n.find !== "string") {
-        warnings.push(`op[${i}]: ${kind} needs find string`);
+        warnings.push(`SKIPPED op[${i}]: ${kind} needs find string`);
         continue;
       }
       if (kind === "replace_text" && typeof n.replace !== "string") {
-        warnings.push(`op[${i}]: replace_text needs replace string`);
+        warnings.push(`SKIPPED op[${i}]: replace_text needs replace string`);
         continue;
       }
       if (n.page != null) n.page = Number(n.page);
@@ -240,24 +240,24 @@ export function validateOperations(rawOps, options = {}) {
       n.x = Number(n.x);
       n.y = Number(n.y);
       if (!n.text || Number.isNaN(n.page)) {
-        warnings.push(`op[${i}]: add_text invalid`);
+        warnings.push(`SKIPPED op[${i}]: add_text invalid`);
         continue;
       }
     } else if (kind === "watermark") {
       if (!n.text) {
-        warnings.push(`op[${i}]: watermark needs text`);
+        warnings.push(`SKIPPED op[${i}]: watermark needs text`);
         continue;
       }
     } else if (kind === "delete_pages" || kind === "rotate_pages") {
       if (!Array.isArray(n.pages) || !n.pages.length) {
-        warnings.push(`op[${i}]: needs pages array`);
+        warnings.push(`SKIPPED op[${i}]: needs pages array`);
         continue;
       }
       n.pages = n.pages.map(Number).filter((p) => p >= 1);
       if (kind === "rotate_pages") {
         const d = Number(n.degrees);
         if (![90, 180, 270].includes(d)) {
-          warnings.push(`op[${i}]: rotate degrees must be 90|180|270`);
+          warnings.push(`SKIPPED op[${i}]: rotate degrees must be 90|180|270`);
           continue;
         }
         n.degrees = d;
@@ -270,7 +270,7 @@ export function validateOperations(rawOps, options = {}) {
       n.height = Number(n.height);
     } else if (kind === "fill_form") {
       if (!n.fields || typeof n.fields !== "object") {
-        warnings.push(`op[${i}]: fill_form needs fields object`);
+        warnings.push(`SKIPPED op[${i}]: fill_form needs fields object`);
         continue;
       }
     }
@@ -758,6 +758,16 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
   const warnings = [...valWarnings];
   const skipped = [];
 
+  const recordSkip = (msg) => {
+    const text = String(msg);
+    if (!warnings.includes(text)) warnings.push(text);
+    if (!skipped.includes(text)) skipped.push(text);
+  };
+
+  for (const w of valWarnings) {
+    if (typeof w === "string" && /skipped/i.test(w)) recordSkip(w);
+  }
+
   const snapshot = await extractSnapshot(pdfBytes);
   const textItems = snapshot.textItems;
   const source = copyBytes(pdfBytes);
@@ -770,6 +780,8 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
   const deleteOps = ops.filter((o) => o.op === "delete_pages");
 
   for (const op of contentOps) {
+    const appliedBefore = applied.length;
+    const skippedBefore = skipped.length;
     try {
       switch (op.op) {
         case "replace_line": {
@@ -994,13 +1006,20 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
                 warnings.push(`fill_form: field not found "${name}"`);
               }
             }
-            applied.push(`fill_form (${filled} fields)`);
+            if (filled) {
+              applied.push(`fill_form (${filled} fields)`);
+            } else {
+              recordSkip("SKIPPED fill_form: no fields changed");
+            }
           } catch (e) {
-            warnings.push(`fill_form: ${e instanceof Error ? e.message : String(e)}`);
+            recordSkip(
+              `SKIPPED fill_form: ${e instanceof Error ? e.message : String(e)}`,
+            );
           }
           break;
         }
         case "rotate_pages": {
+          let rotated = 0;
           for (const p of op.pages) {
             const idx = pageIndex(p, doc.getPageCount());
             if (idx == null) {
@@ -1010,8 +1029,13 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
             const page = doc.getPage(idx);
             const current = page.getRotation().angle;
             page.setRotation(degrees((current + op.degrees) % 360));
+            rotated++;
           }
-          applied.push(`rotate_pages ${op.pages.join(",")} by ${op.degrees}°`);
+          if (rotated) {
+            applied.push(`rotate_pages ${op.pages.join(",")} by ${op.degrees}°`);
+          } else {
+            recordSkip("SKIPPED rotate_pages: no pages changed");
+          }
           break;
         }
         case "draw_rect": {
@@ -1035,15 +1059,23 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
           break;
         }
         default:
-          warnings.push(`unknown op: ${op.op}`);
+          recordSkip(`SKIPPED ${op.op}: unknown op`);
       }
     } catch (e) {
-      warnings.push(`${op.op}: ${e instanceof Error ? e.message : String(e)}`);
+      recordSkip(
+        `SKIPPED ${op.op}: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    if (applied.length === appliedBefore && skipped.length === skippedBefore) {
+      recordSkip(`SKIPPED ${op.op}: did not apply`);
     }
   }
 
   for (const op of deleteOps) {
+    const appliedBefore = applied.length;
+    const skippedBefore = skipped.length;
     const sorted = [...new Set(op.pages)].sort((a, b) => b - a);
+    let removed = 0;
     for (const p of sorted) {
       const idx = pageIndex(p, doc.getPageCount());
       if (idx == null) {
@@ -1051,8 +1083,16 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
         continue;
       }
       doc.removePage(idx);
+      removed++;
     }
-    applied.push(`delete_pages ${op.pages.join(",")}`);
+    if (removed) {
+      applied.push(`delete_pages ${op.pages.join(",")}`);
+    } else {
+      recordSkip("SKIPPED delete_pages: no pages changed");
+    }
+    if (applied.length === appliedBefore && skipped.length === skippedBefore) {
+      recordSkip("SKIPPED delete_pages: did not apply");
+    }
   }
 
   // Once per apply: disclose cover-and-redraw semantics (not content-stream delete)
@@ -1067,9 +1107,9 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
 
   const bytes = await doc.save();
 
-  // Also count soft SKIPPED strings that weren't tracked above
+  // Harvest every dropped/no-op, including validateOperations lowercase "skipped"
   for (const w of warnings) {
-    if (typeof w === "string" && w.includes("SKIPPED") && !skipped.includes(w)) {
+    if (typeof w === "string" && /skipped/i.test(w) && !skipped.includes(w)) {
       skipped.push(w);
     }
   }
@@ -1316,18 +1356,13 @@ Rules:
 - Never invent pages or invent id numbers not present in the snapshot.
 - Output JSON only.`;
 
-const PROXY_HOSTS = new Set([
-  "api.openai.com",
-  "api.x.ai",
-  "openrouter.ai",
-  "api.groq.com",
-  "api.together.xyz",
-]);
-
-function shouldUseProxy(baseUrl) {
+async function sameOriginLlmProxyExists(signal) {
   try {
-    const host = new URL(baseUrl).hostname.toLowerCase();
-    return PROXY_HOSTS.has(host);
+    const probe = await fetch("/api/llm-proxy", {
+      method: "HEAD",
+      signal,
+    });
+    return probe.status !== 404;
   } catch {
     return false;
   }
@@ -1350,7 +1385,6 @@ async function chatCompletions({
   const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const directUrl = `${String(baseUrl).replace(/\/$/, "")}/chat/completions`;
-  const useProxy = shouldUseProxy(baseUrl);
 
   async function post(url, extra = {}) {
     return fetch(url, {
@@ -1368,19 +1402,23 @@ async function chatCompletions({
 
   try {
     let res;
+    const proxyHeaders = {
+      "X-Patchpdf-Base-Url": String(baseUrl).replace(/\/$/, ""),
+    };
+    // This repo does not ship /api/llm-proxy. Use it only when the host exists.
+    const useProxy = await sameOriginLlmProxyExists(controller.signal);
     if (useProxy) {
-      // Cloud providers block browser CORS — use same-origin allowlisted proxy
-      res = await post("/api/llm-proxy", {
-        "X-Patchpdf-Base-Url": String(baseUrl).replace(/\/$/, ""),
-      });
+      res = await post("/api/llm-proxy", proxyHeaders);
+      if (res.status === 404) {
+        res = await post(directUrl);
+      }
     } else {
-      // Local Ollama / custom gateways with CORS
       try {
         res = await post(directUrl);
       } catch (directErr) {
         throw new Error(
-          `Could not reach ${baseUrl}. For local models enable CORS (Ollama). ` +
-            `Cloud providers work via the site proxy automatically. ` +
+          `Could not reach ${baseUrl}. Enable CORS on the provider, or host ` +
+            `/api/llm-proxy on this origin. ` +
             `(${directErr instanceof Error ? directErr.message : directErr})`,
         );
       }
@@ -1479,10 +1517,17 @@ export async function editPdf({
     };
   }
 
+  const hasKey = Boolean(apiKey || prof.defaultApiKey);
+  if (!localOnly && prof.kind === "openai-compatible" && !hasKey) {
+    throw new Error(
+      "API key required for this OpenAI-compatible profile. Refusing local-pattern fallback.",
+    );
+  }
+
   const useAi =
     !localOnly &&
     prof.kind !== "local" &&
-    Boolean(apiKey || prof.defaultApiKey) &&
+    hasKey &&
     Boolean(baseUrl || prof.baseUrl);
 
   if (useAi) {
@@ -1517,11 +1562,35 @@ export async function editPdf({
     };
   }
 
+  const localOps = parseLocalOps(instruction);
+  if (dryRun) {
+    if (!localOps.length) {
+      throw new Error(
+        "No AI credentials and instruction did not match local patterns.\n" +
+          'Try: replace "old" with "new" | watermark "DRAFT" | delete pages 2 | Or pick a provider + API key.',
+      );
+    }
+    return {
+      bytes: pdfBytes,
+      applied: [],
+      skipped: [],
+      warnings: [],
+      plan: {
+        summary: "Dry run (local patterns; not applied)",
+        operations: localOps,
+      },
+      snapshot,
+      mode: "local",
+      profileId: profile,
+    };
+  }
+
   const local = await applyLocalInstruction(pdfBytes, instruction);
   if (local) {
     return {
       bytes: local.bytes,
       applied: local.applied,
+      skipped: local.skipped || [],
       warnings: local.warnings,
       plan: {
         summary: local.applied.join("; ") || "Local pattern edit",
@@ -1832,6 +1901,11 @@ export async function exportPdfToDocx(pdfBytes, options = {}) {
   const warnings = [];
   const mode = options.mode || "layout";
   const snapshot = await extractSnapshot(pdfBytes);
+  if (options.fromEditedBytes === true) {
+    warnings.push(
+      "Export extracted from edited PDF bytes. Cover-and-redraw leaves original glyphs in the content stream, so this DOCX may include both original and replacement text. Prefer the in-memory line table when you need only the visible replacement.",
+    );
+  }
 
   if (!snapshot.textItems.length && snapshot.fullText) {
     warnings.push(
