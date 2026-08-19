@@ -227,11 +227,13 @@ export function validateOperations(rawOps, options = {}) {
         continue;
       }
       if (n.page != null) n.page = Number(n.page);
+      if (n.id != null) n.id = Number(n.id);
+      if (n.itemIndex != null) n.itemIndex = Number(n.itemIndex);
+      // default: fail closed on multi-match unless all:true or id/itemIndex
+      if (n.all == null) n.all = false;
       if (kind === "replace_text") {
         n.fit = n.fit !== false;
         n.force = n.force === true;
-        // default: fail closed on multi-match unless all:true
-        if (n.all == null) n.all = false;
       }
     } else if (kind === "add_text") {
       n.page = Number(n.page);
@@ -742,7 +744,6 @@ function lineReplaceText(runStr, find, replace) {
  * @param {boolean} [options.failOnSkip=false] Throw if any SKIPPED / refused op
  * @param {number} [options.maxOps] Cap op count (default 200)
  * @param {number} [options.requireApplied] Require at least N applied ops
- * @param {boolean} [options.preserveFontMetrics=true] Prefer not shrinking below ~1.5pt of original without force (soft mode already enforces 8pt floor)
  * @returns {Promise<{ bytes: Uint8Array, applied: string[], warnings: string[], skipped: string[] }>}
  */
 export async function applyOperations(pdfBytes, operations, options = {}) {
@@ -886,13 +887,39 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
             warnings.push(`cover: no match for "${op.find}"`);
             break;
           }
-          for (const m of matches) {
+          let targets = matches;
+          if (op.id != null) {
+            targets = matches.filter((m) => m.id === op.id);
+            if (!targets.length) {
+              const msg = `SKIPPED cover: id #${op.id} did not match find "${op.find}"`;
+              warnings.push(msg);
+              skipped.push(msg);
+              break;
+            }
+          } else if (op.itemIndex != null) {
+            if (matches[op.itemIndex]) {
+              targets = [matches[op.itemIndex]];
+            } else {
+              const msg =
+                `SKIPPED cover: itemIndex ${op.itemIndex} out of range for "${op.find}" (${matches.length} hits)`;
+              warnings.push(msg);
+              skipped.push(msg);
+              break;
+            }
+          } else if (matches.length > 1 && op.all !== true) {
+            const msg =
+              `SKIPPED cover: ${matches.length} matches for "${op.find}" (ids ${describeIds(matches)}). Set all:true to cover every occurrence, or pass id/itemIndex for one cell.`;
+            warnings.push(msg);
+            skipped.push(msg);
+            break;
+          }
+          for (const m of targets) {
             const idx = pageIndex(m.page, doc.getPageCount());
             if (idx == null) continue;
             coverAndWrite(doc.getPage(idx), font, m, "", { coverOnly: true });
           }
           applied.push(
-            `cover "${op.find}" (${matches.length} hits — visual only, not forensic redaction)`,
+            `cover "${op.find}" (${targets.length} hits: visual only, not forensic redaction)`,
           );
           break;
         }
@@ -1263,7 +1290,8 @@ Available operations (use only these):
    force:true allows font crush below 8pt; otherwise too-long cell text is SKIPPED.
 2. replace_text — { "op":"replace_text", "find":"snippet", "replace":"new", "page"?:1, "all"?:true, "fit"?:true, "force"?:false }
    Multiple matches require all:true or the op is SKIPPED. Prefer replace_line + id for one cell.
-3. cover — visual whiteout only (NOT forensic redaction). { "op":"cover", "find":"text", "page"?:number }
+3. cover — visual whiteout only (NOT forensic redaction). { "op":"cover", "find":"text", "page"?:number, "all"?:true, "id"?:number, "itemIndex"?:number }
+   Multiple matches require all:true or id/itemIndex or the op is SKIPPED.
 4. add_text — { "op":"add_text", "page":1, "x":number, "y":number, "text":"...", "size"?:12, "color"?:"#111111" }
 5. watermark — { "op":"watermark", "text":"CONFIDENTIAL", "opacity"?:0.15, "angle"?:-35, "size"?:48 }
 6. set_metadata — { "op":"set_metadata", "title"?:string, "author"?:string, "subject"?:string, "keywords"?:string[] }

@@ -1,9 +1,9 @@
-# patchpdf — Agent / programmatic API
+# patchpdf: Agent / programmatic API
 
 **Audience:** coding agents and scripts that edit PDFs surgically.  
 **Not for:** the human demo UI (unchanged look and flow).
 
-The product goal is **safer than regenerating** a typeset PDF when you only need fact/label fixes: keep layout, fonts, and pagination; change words by `id`. Prefer patch over regen for fidelity and risk — not because every wall-clock race wins.
+The product goal is **safer than regenerating** a typeset PDF when you only need fact/label fixes: keep layout and pagination; replacement glyphs are Helvetica; change words by `id`. Prefer patch over regen for fidelity and risk, not because every wall-clock race wins.
 
 Official engine (MIT): this repo’s `engine.js`.  
 Hosted product UI on martialgames.net loads the same engine but **does not expose** these helpers in the browser chrome.
@@ -36,7 +36,7 @@ Measured on the OSS engine (`engine.js` in headless Chromium, pdf.js extract + p
 | 20-page dense, ~3 ops | ~150–160 ms | ~45 ms | ~20 ms |
 | 50-page dense, ~3 ops | ~230–550 ms | ~90 ms | ~50–70 ms |
 
-**Apply-only** (patchmap already built): ~50 ms (1p) / ~120 ms (50p) — still usually slower than a minimal redraw.
+**Apply-only** (patchmap already built): ~50 ms (1p) / ~120 ms (50p), still usually slower than a minimal redraw.
 
 ### Why patch loses pure wall-clock races
 
@@ -49,9 +49,9 @@ Measured on the OSS engine (`engine.js` in headless Chromium, pdf.js extract + p
 
 | Situation | Prefer |
 |-----------|--------|
-| Re-running the real report pipeline (charts, LLM draft, LaTeX, multi-second job) | **Patch** — sub-second vs seconds–minutes |
+| Re-running the real report pipeline (charts, LLM draft, LaTeX, multi-second job) | **Patch**: sub-second vs seconds to minutes |
 | You only have the PDF (no HTML/template/generator) | **Patch** |
-| Must preserve fonts, boxes, pagination pixel-faithfully | **Patch** |
+| Must keep layout and pagination (replacement glyphs are Helvetica) | **Patch** |
 | You own a fast generator and only care about ms, layout may change | **Regen** |
 | Forensic extract purity (old glyphs must vanish) | **Regen** or true stream rewrite (cover-paint is visual) |
 
@@ -104,7 +104,7 @@ Third argument is **agent-only** (UI omits it).
 |--------|---------|--------|
 | `failOnSkip` | `false` | If `true`, **throw** when any op is SKIPPED / refused |
 | `maxOps` | `200` | Hard cap on op list length |
-| `requireApplied` | — | Require at least N successful applies |
+| `requireApplied` | (none) | Require at least N successful applies |
 
 Return value now includes **`skipped: string[]`** in addition to `applied` and `warnings`.
 
@@ -118,7 +118,7 @@ const { bytes, applied, skipped, warnings } = await applyOperations(
 
 ---
 
-## `patchPdfAgent(pdfBytes, request)` — one-shot
+## `patchPdfAgent(pdfBytes, request)`: one-shot
 
 Agent defaults: **`failOnSkip: true`**, **`maxOps: 32`**.
 
@@ -139,7 +139,7 @@ const out = await patchPdfAgent(pdfBytes, {
   requireApplied: 1,
   verify: {
     contains: ["1.1%"],
-    // notContains is soft unless strictExtract — cover-paint leaves old glyphs
+    // notContains is soft unless strictExtract: cover-paint leaves old glyphs
     notContains: ["0.0%"],
     strictExtract: false,
   },
