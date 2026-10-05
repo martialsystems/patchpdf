@@ -1,0 +1,11 @@
+{
+  "name": "patchpdf-tests",
+  "private": true,
+  "type": "module",
+  "description": "Node checks for the browser engine.",
+  "dependencies": {
+    "docx": "9.5.1",
+    "pdf-lib": "1.17.1",
+    "pdfjs-dist": "4.10.38"
+  }
+}

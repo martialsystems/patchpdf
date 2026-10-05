@@ -10,6 +10,7 @@ import {
   opsFromHumanEdits,
   editPdf,
   exportPdfToDocx,
+  planActivityMessage,
   BUILTIN_PROFILES,
 } from "./engine.js";
 
@@ -184,13 +185,6 @@ async function loadPdf(bytes, name) {
 
   const snap = await extractSnapshot(state.pdfBytes);
   state.snapshot = snap;
-  state.lines = (snap.textItems || []).map((t) => ({
-    id: t.id,
-    page: t.page,
-    original: t.str,
-    edited: t.str,
-    fontSize: t.fontSize,
-  }));
   state.meta = {
     title: snap.metadata.title || "",
     author: snap.metadata.author || "",
@@ -200,6 +194,24 @@ async function loadPdf(bytes, name) {
   els.metaTitle.value = state.meta.title;
   els.metaAuthor.value = state.meta.author;
   els.metaSubject.value = state.meta.subject;
+
+  if (snap.error) {
+    state.lines = [];
+    els.pageFilter.innerHTML = `<option value="all">All pages</option>`;
+    renderLines();
+    setPreview("original");
+    els.statusLines.textContent = `${snap.pageCount} page(s) · text extract failed`;
+    setMsg(snap.error, "error");
+    els.resultBox.textContent = "";
+    return;
+  }
+  state.lines = (snap.textItems || []).map((t) => ({
+    id: t.id,
+    page: t.page,
+    original: t.str,
+    edited: t.str,
+    fontSize: t.fontSize,
+  }));
 
   // page filter options
   const pages = [...new Set(state.lines.map((l) => l.page))].sort((a, b) => a - b);
@@ -364,14 +376,19 @@ async function runAi({ dryRun }) {
     return;
   }
   setBusy(true);
+  const opts = profileOpts();
+  const prof = BUILTIN_PROFILES[opts.profile] || BUILTIN_PROFILES.local;
   setMsg(
-    dryRun
-      ? "Planning with your provider (PDF never leaves the browser)…"
-      : "Planning + applying…",
+    planActivityMessage({
+      dryRun,
+      localOnly: opts.localOnly,
+      kind: prof.kind,
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+    }),
     "info",
   );
   try {
-    const opts = profileOpts();
     const result = await editPdf({
       pdfBytes: state.pdfBytes,
       instruction,

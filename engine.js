@@ -30,6 +30,28 @@ import {
 pdfjs.GlobalWorkerOptions.workerSrc =
   "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs";
 
+/**
+ * Status line for Plan and Plan-and-apply.
+ * Local patterns stay in the browser. A provider plan sends the text snapshot.
+ */
+export function planActivityMessage({
+  dryRun = false,
+  localOnly = false,
+  kind = "local",
+  apiKey = "",
+  baseUrl = "",
+} = {}) {
+  const sendsSnapshot =
+    !localOnly && kind !== "local" && Boolean(apiKey) && Boolean(baseUrl);
+  if (!sendsSnapshot) {
+    return dryRun
+      ? "Planning with local patterns. The file stays in this browser."
+      : "Applying local patterns. The file stays in this browser.";
+  }
+  const verb = dryRun ? "Planning" : "Planning and applying";
+  return `${verb}. The file stays in this browser. The extracted text snapshot is sent to the provider.`;
+}
+
 /** Built-in OpenAI-compatible profiles (keys stay in the browser). */
 export const BUILTIN_PROFILES = {
   local: {
@@ -300,6 +322,48 @@ export function parsePlan(raw) {
   };
 }
 
+/**
+ * Reading order: top to bottom, then left to right.
+ * A new line starts when the baseline is more than 2pt from that line's
+ * top anchor, so a chain of 2pt steps cannot reorder a higher line under a lower one.
+ */
+export function sortReadingOrder(items) {
+  const pending = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+  const lines = [];
+  for (const item of pending) {
+    const line = lines.length ? lines[lines.length - 1] : null;
+    if (line && Math.abs(line.anchorY - item.y) <= 2) {
+      line.items.push(item);
+    } else {
+      lines.push({ anchorY: item.y, items: [item] });
+    }
+  }
+  const ordered = [];
+  for (const line of lines) {
+    line.items.sort((a, b) => a.x - b.x || b.y - a.y);
+    ordered.push(...line.items);
+  }
+  return ordered;
+}
+
+/**
+ * White cover box. y is the baseline. The box extends 0.25em below it so
+ * Helvetica descenders (about 0.207em) sit inside the rectangle.
+ */
+export function coverRect(item, size, { pad = 1.2, fit = true, textWidth = 0 } = {}) {
+  const boxW = Math.max(item.width || 0, 4);
+  const coverW = (fit ? boxW : Math.max(boxW, textWidth)) + pad * 2;
+  const fontSize = Math.max(item.fontSize || 0, size || 0, 1);
+  const below = fontSize * 0.25 + pad;
+  const above = Math.max(item.height || 0, item.fontSize || 0, size || 0) + pad;
+  return {
+    x: item.x - pad,
+    y: item.y - below,
+    width: coverW,
+    height: below + above,
+  };
+}
+
 /* ─── Extract ─── */
 
 export async function extractSnapshot(pdfBytes) {
@@ -389,11 +453,9 @@ export async function extractSnapshot(pdfBytes) {
         strings.push(item.str);
       }
 
-      pageItems.sort((a, b) => {
-        const dy = Math.abs(a.y - b.y) > 2 ? b.y - a.y : 0;
-        if (dy !== 0) return dy > 0 ? 1 : -1;
-        return a.x - b.x;
-      });
+      const ordered = sortReadingOrder(pageItems);
+      pageItems.length = 0;
+      pageItems.push(...ordered);
       // re-id after sort for stable reading order in UI
       for (const it of pageItems) {
         it.id = textItems.length;
@@ -404,8 +466,20 @@ export async function extractSnapshot(pdfBytes) {
 
     fullText = textByPage.join("\n\n--- page break ---\n\n");
   } catch (err) {
-    fullText = `(text extraction failed: ${err instanceof Error ? err.message : String(err)})`;
+    const message = err instanceof Error ? err.message : String(err);
+    fullText = "";
     textByPage = Array.from({ length: pageCount }, () => "");
+    textItems = [];
+    return {
+      pageCount,
+      pageSizes,
+      textByPage,
+      fullText,
+      textItems,
+      formFields,
+      metadata,
+      error: `text extraction failed: ${message}`,
+    };
   }
 
   return {
@@ -416,6 +490,7 @@ export async function extractSnapshot(pdfBytes) {
     textItems,
     formFields,
     metadata,
+    error: null,
   };
 }
 
@@ -588,14 +663,13 @@ function coverAndWrite(page, font, item, newText, opts = {}) {
 
   const textWidth =
     newText && !opts.coverOnly ? font.widthOfTextAtSize(newText, size) : 0;
-  const coverW = (fit ? boxW : Math.max(boxW, textWidth)) + pad * 2;
-  const coverH = Math.max(item.height, item.fontSize || size, size) + pad * 2;
+  const rect = coverRect(item, size, { pad, fit, textWidth });
 
   page.drawRectangle({
-    x: item.x - pad,
-    y: item.y - pad * 0.6,
-    width: coverW,
-    height: coverH,
+    x: rect.x,
+    y: rect.y,
+    width: rect.width,
+    height: rect.height,
     color: rgb(1, 1, 1),
     borderWidth: 0,
   });
@@ -630,9 +704,18 @@ function describeIds(arr) {
   );
 }
 
+function pickItemIndex(list, itemIndex) {
+  const idx = Number(itemIndex);
+  if (!Number.isInteger(idx) || idx < 0 || idx >= list.length) {
+    return { ok: false, target: null };
+  }
+  return { ok: true, target: list[idx] };
+}
+
 /**
  * Resolve which text run a replace_line op targets.
- * Fail closed: multiple matches without id/itemIndex → target null + skipped reason.
+ * Fail closed: multiple matches without id/itemIndex, or an itemIndex
+ * outside that match list, leave the run unchanged.
  */
 function resolveLineTarget(textItems, op) {
   const warnings = [];
@@ -663,13 +746,21 @@ function resolveLineTarget(textItems, op) {
   // 2) exact string match on page
   const same = textItems.filter((t) => onPage(t) && exactFind(t));
   if (same.length) {
-    if (op.itemIndex != null && same[op.itemIndex]) {
-      return { target: same[op.itemIndex], warnings, skipped: null };
+    if (op.itemIndex != null) {
+      const picked = pickItemIndex(same, op.itemIndex);
+      if (!picked.ok) {
+        return {
+          target: null,
+          warnings,
+          skipped: `SKIPPED replace_line: itemIndex ${op.itemIndex} out of range for "${find}" (${same.length} exact matches, ids ${describeIds(same)}).`,
+        };
+      }
+      return { target: picked.target, warnings, skipped: null };
     }
     if (same.length === 1) {
       return { target: same[0], warnings, skipped: null };
     }
-    // Fail closed — do not silently pick same[0]
+    // Fail closed: do not silently pick same[0]
     return {
       target: null,
       warnings,
@@ -680,8 +771,16 @@ function resolveLineTarget(textItems, op) {
   // 3) substring match
   const soft = textItems.filter((t) => onPage(t) && softFind(t));
   if (!soft.length) return { target: null, warnings, skipped: null };
-  if (op.itemIndex != null && soft[op.itemIndex]) {
-    return { target: soft[op.itemIndex], warnings, skipped: null };
+  if (op.itemIndex != null) {
+    const picked = pickItemIndex(soft, op.itemIndex);
+    if (!picked.ok) {
+      return {
+        target: null,
+        warnings,
+        skipped: `SKIPPED replace_line: itemIndex ${op.itemIndex} out of range for "${find}" (${soft.length} substring matches, ids ${describeIds(soft)}).`,
+      };
+    }
+    return { target: picked.target, warnings, skipped: null };
   }
   if (soft.length === 1) return { target: soft[0], warnings, skipped: null };
   return {
@@ -720,8 +819,8 @@ function decideFit(font, item, newText, op) {
   return { ok: true, size, refuseReason: null, metrics, force };
 }
 
-/** Build replacement string: splice find→replace inside the run; never drop labels. */
-function lineReplaceText(runStr, find, replace) {
+/** Build replacement string: splice find to replace inside the run; never drop labels. */
+export function lineReplaceText(runStr, find, replace) {
   if (runStr == null) return replace;
   const s = String(runStr);
   const f = String(find ?? "");
@@ -729,7 +828,7 @@ function lineReplaceText(runStr, find, replace) {
   if (!f) return r;
   if (s === f) return r;
   if (s.toLowerCase().includes(f.toLowerCase())) {
-    return s.replace(new RegExp(escapeRegExp(f), "gi"), r);
+    return s.replace(new RegExp(escapeRegExp(f), "gi"), () => r);
   }
   // No substring match — only then replace the whole run
   return r;
@@ -769,10 +868,16 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
   }
 
   const snapshot = await extractSnapshot(pdfBytes);
+  if (snapshot.error) {
+    throw new Error(snapshot.error);
+  }
   const textItems = snapshot.textItems;
   const source = copyBytes(pdfBytes);
 
-  const doc = await PDFDocument.load(source, { ignoreEncryption: true });
+  const doc = await PDFDocument.load(source, {
+    ignoreEncryption: true,
+    updateMetadata: false,
+  });
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const fontBold = await doc.embedFont(StandardFonts.HelveticaBold);
 
@@ -864,7 +969,7 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
             let newStr = m.str;
             if (m.str.toLowerCase().includes(op.find.toLowerCase())) {
               const re = new RegExp(escapeRegExp(op.find), "gi");
-              newStr = m.str.replace(re, op.replace);
+              newStr = m.str.replace(re, () => op.replace);
             } else {
               newStr = op.replace;
             }
@@ -973,6 +1078,18 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
           break;
         }
         case "set_metadata": {
+          const bad = [];
+          if (op.title != null && typeof op.title !== "string") bad.push("title");
+          if (op.author != null && typeof op.author !== "string") bad.push("author");
+          if (op.subject != null && typeof op.subject !== "string") bad.push("subject");
+          if (op.creator != null && typeof op.creator !== "string") bad.push("creator");
+          if (op.keywords != null && !Array.isArray(op.keywords)) bad.push("keywords");
+          if (bad.length) {
+            recordSkip(
+              `SKIPPED set_metadata: ${bad.join(", ")} has the wrong type`,
+            );
+            break;
+          }
           if (op.title != null) doc.setTitle(op.title);
           if (op.author != null) doc.setAuthor(op.author);
           if (op.subject != null) doc.setSubject(op.subject);
@@ -1071,21 +1188,26 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
     }
   }
 
+  // Page numbers are original 1-based indexes across every delete op.
+  // Remove the union once, high to low, so a later op cannot address a shifted page.
+  const removedPages = new Set();
+  const uniqueDesc = [
+    ...new Set(deleteOps.flatMap((op) => op.pages)),
+  ].sort((a, b) => b - a);
+  for (const p of uniqueDesc) {
+    const idx = pageIndex(p, doc.getPageCount());
+    if (idx == null) {
+      warnings.push(`delete_pages: invalid page ${p}`);
+      continue;
+    }
+    doc.removePage(idx);
+    removedPages.add(p);
+  }
   for (const op of deleteOps) {
     const appliedBefore = applied.length;
     const skippedBefore = skipped.length;
-    const sorted = [...new Set(op.pages)].sort((a, b) => b - a);
-    let removed = 0;
-    for (const p of sorted) {
-      const idx = pageIndex(p, doc.getPageCount());
-      if (idx == null) {
-        warnings.push(`delete_pages: invalid page ${p}`);
-        continue;
-      }
-      doc.removePage(idx);
-      removed++;
-    }
-    if (removed) {
+    const got = op.pages.filter((p) => removedPages.has(p));
+    if (got.length) {
       applied.push(`delete_pages ${op.pages.join(",")}`);
     } else {
       recordSkip("SKIPPED delete_pages: no pages changed");
@@ -1145,6 +1267,9 @@ export async function applyOperations(pdfBytes, operations, options = {}) {
 export async function buildPatchmap(pdfBytes, options = {}) {
   const maxStr = options.maxStr != null ? Number(options.maxStr) : 500;
   const snap = await extractSnapshot(pdfBytes);
+  if (snap.error) {
+    throw new Error(snap.error);
+  }
   const lines = (snap.textItems || []).map((t) => ({
     id: t.id,
     page: t.page,
@@ -1188,9 +1313,20 @@ function round4(n) {
  */
 export async function verifyPdfText(pdfBytes, spec = {}) {
   const snap = await extractSnapshot(pdfBytes);
-  const fullText = snap.fullText || "";
   const contains = Array.isArray(spec.contains) ? spec.contains : [];
   const notContains = Array.isArray(spec.notContains) ? spec.notContains : [];
+  if (snap.error) {
+    return {
+      ok: false,
+      fullText: "",
+      missing: contains.filter(Boolean),
+      stillPresent: [],
+      warnings: [snap.error],
+      pageCount: snap.pageCount,
+      error: snap.error,
+    };
+  }
+  const fullText = snap.fullText || "";
   const strictExtract = spec.strictExtract === true;
   const missing = [];
   const stillPresent = [];
@@ -1337,6 +1473,7 @@ Available operations (use only these):
 6. set_metadata — { "op":"set_metadata", "title"?:string, "author"?:string, "subject"?:string, "keywords"?:string[] }
 7. fill_form — { "op":"fill_form", "fields": { "FieldName": "value" } }
 8. delete_pages — { "op":"delete_pages", "pages":[2,3] }
+   Page numbers are original 1-based indexes. Several delete_pages ops are combined and removed once, from high to low.
 9. rotate_pages — { "op":"rotate_pages", "pages":[1], "degrees":90 }
 10. draw_rect — { "op":"draw_rect", "page":1, "x":0, "y":0, "width":100, "height":20, "color"?:"#ffffff", "fill"?:true }
 
@@ -1492,6 +1629,9 @@ export async function editPdf({
   dryRun = false,
 }) {
   const snapshot = await extractSnapshot(pdfBytes);
+  if (snapshot.error) {
+    throw new Error(snapshot.error);
+  }
   const prof = BUILTIN_PROFILES[profile] || BUILTIN_PROFILES.local;
 
   if (plan) {
@@ -1901,6 +2041,9 @@ export async function exportPdfToDocx(pdfBytes, options = {}) {
   const warnings = [];
   const mode = options.mode || "layout";
   const snapshot = await extractSnapshot(pdfBytes);
+  if (snapshot.error) {
+    throw new Error(snapshot.error);
+  }
   if (options.fromEditedBytes === true) {
     warnings.push(
       "Export extracted from edited PDF bytes. Cover-and-redraw leaves original glyphs in the content stream, so this DOCX may include both original and replacement text. Prefer the in-memory line table when you need only the visible replacement.",
